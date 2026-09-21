@@ -956,47 +956,87 @@ class Molecule:
         return np.linalg.norm(
             self.positions[idx1 - 1] - self.positions[idx2 - 1]
         )
-        
-    def atom_distances(self):
-        """Return an N-by-N Cartesian atom-distance matrix in angstroms.
+
+    @property
+    def distances_matrix(self):
+        """Return current N-by-N Cartesian distances in angstroms.
         """
+        self._validate_matrix_positions()
+        return cdist(self.positions, self.positions)
+
+    @property
+    def angles_matrix(self):
+        """Return connected angle rows [i, j, k, angle_degrees].
+        """
+        return self.geometry_table(self._connected_geometry_indices(3))
+
+    @property
+    def dihedrals_matrix(self):
+        """Return connected torsion rows [i, j, k, l, dihedral_degrees].
+        """
+        return self.geometry_table(self._connected_geometry_indices(4))
+
+    def _validate_matrix_positions(self):
+        """Validate coordinates before computing geometry matrix properties."""
         positions = np.asarray(self.positions)
         if (
             positions.shape != (self.num_atoms, 3)
             or not np.isfinite(positions).all()
         ):
-            raise ValueError(
-                "Distance matrix requires finite N-by-3 coordinates."
-            )
-        distances = np.zeros((self.num_atoms, self.num_atoms), dtype=float)
-        for i in range(self.num_atoms):
-            for j in range(i + 1, self.num_atoms):
-                distance = self.get_distance(i + 1, j + 1)
-                distances[i, j] = distances[j, i] = distance
-        return distances
+            raise ValueError("Geometry matrices need finite N-by-3 coordinates.")
 
-    @classmethod
-    def all_distances(cls, molecules):
-        """
-        Return a geometry-by-unique-atom-pair distance matrix in angstroms.
-        Use atom_distances for each geometry.
-        """
-        molecules = list(molecules)
-        if not molecules:
-            raise ValueError("Provide at least one geometry.")
-        if not all(isinstance(molecule, cls) for molecule in molecules):
-            raise TypeError("All geometries must be Molecule objects.")
-        symbols = list(molecules[0].symbols)
-        pairs = np.triu_indices(len(symbols), k=1)
-        rows = []
-        for molecule in molecules:
-            if list(molecule.symbols) != symbols:
-                raise ValueError(
-                    "Geometries have different element sequences."
-                )
-            rows.append(molecule.atom_distances()[pairs])
-        return np.stack(rows)
+    def _connected_geometry_indices(self, order):
+        """Enumerate distinct connected triples/quartets in this geometry."""
+        from itertools import combinations
 
+        self._validate_matrix_positions()
+        if order not in (3, 4):
+            raise ValueError("Connected geometry order must be 3 or 4.")
+        graph = self.to_graph()
+        indices = set()
+        if order == 3:
+            for center in sorted(graph):
+                for first, last in combinations(sorted(graph[center]), 2):
+                    indices.add((first + 1, center + 1, last + 1))
+        else:
+            for second, third in graph.edges:
+                for first in graph[second]:
+                    for last in graph[third]:
+                        path = (first, second, third, last)
+                        if len(set(path)) == 4:
+                            labelled = tuple(int(i + 1) for i in path)
+                            indices.add(min(labelled, labelled[::-1]))
+        return np.asarray(sorted(indices), dtype=int).reshape(-1, order)
+
+    def geometry_table(self, atom_indices):
+        """Evaluate explicit angle/torsion combinations, regardless of bonds.
+        """
+        self._validate_matrix_positions()
+        indices = np.asarray(atom_indices)
+        if indices.ndim != 2 or indices.shape[1] not in (3, 4):
+            raise ValueError("Provide an M-by-3 or M-by-4 atom-index array.")
+        if not np.issubdtype(indices.dtype, np.integer):
+            raise TypeError("Geometry atom indices must be integers.")
+        order = indices.shape[1]
+        table = np.empty((len(indices), order + 1), dtype=float)
+        table[:, :order] = indices
+        positions = np.asarray(self.positions, dtype=float)
+        method = (
+            self.get_angle_from_positions
+            if order == 3
+            else self.get_dihedral_from_positions
+        )
+        for row, atoms in enumerate(indices):
+            self._validate_geometry_indices(*atoms)
+            if len(set(atoms)) != order:
+                raise ValueError("Each geometry row needs distinct atoms.")
+            try:
+                table[row, order] = method(*positions[atoms - 1])
+            except ValueError:
+                # Coordinates and indices have been validated above. The
+                # original angle/torsion methods reject degenerate vectors.
+                table[row, order] = np.nan
+        return table
 
     def _validate_geometry_indices(self, *indices):
         """Validate public, 1-based atom indices used by geometry methods."""
@@ -1157,90 +1197,6 @@ class Molecule:
             return [molecule]
         else:
             return molecule
-
-    @classmethod
-    def from_irc_filepath(cls, filepath, index="-1", return_list=False):
-        """Load recorded Gaussian IRC points through a separate entry point.
-        """
-        filepath = os.path.abspath(os.fspath(filepath))
-        suffix = os.path.splitext(filepath)[1].lower()
-        if suffix not in {".log", ".out"}:
-            raise ValueError(
-                "Recorded IRC loading supports Gaussian output only."
-            )
-        if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"{filepath} could not be found!")
-        if os.path.getsize(filepath) == 0:
-            return None
-        if suffix == ".out":
-            from chemsmart.utils.io import get_program_type_from_file
-
-            if get_program_type_from_file(filepath) != "gaussian":
-                raise ValueError("Recorded IRC loading is Gaussian-only.")
-        molecule = cls._read_gaussian_irc_logfile(filepath, index=index)
-        if return_list and not isinstance(molecule, list):
-            return [molecule]
-        return molecule
-
-    @classmethod
-    def select_geometries(cls, filepath, first_index, second_index):
-        """Return two user-selected recorded Gaussian IRC geometries.
-        No other-format selection is provided by this method. 
-        Points are not automatically classified as stable chemical intermediates.
-        """
-        for index in (first_index, second_index):
-            if isinstance(index, bool) or not isinstance(
-                index, (int, np.integer)
-            ):
-                raise TypeError("Geometry indices must be integers.")
-            if index < 1:
-                raise ValueError(
-                    "Geometry indices must be positive and 1-based."
-                )
-        if first_index == second_index:
-            raise ValueError("Choose two different geometry indices.")
-
-        suffix = os.path.splitext(os.fspath(filepath))[1].lower()
-        if suffix not in {".log", ".out"}:
-            raise ValueError(
-                "This selector supports Gaussian IRC output only."
-            )
-        if suffix == ".out":
-            from chemsmart.utils.io import get_program_type_from_file
-
-            if get_program_type_from_file(filepath) != "gaussian":
-                raise ValueError("Recorded IRC selection is Gaussian-only.")
-
-        geometries = cls.from_irc_filepath(
-            filepath, index=":", return_list=True
-        )
-        if not geometries:
-            raise ValueError("No geometries were found in the input file.")
-        if not all("irc_point" in mol.info for mol in geometries):
-            raise ValueError(
-                "The reader did not return recorded IRC metadata."
-            )
-        if max(first_index, second_index) > len(geometries):
-            raise IndexError(
-                f"Geometry index exceeds the {len(geometries)} "
-                "available geometries."
-            )
-        first = geometries[first_index - 1]
-        second = geometries[second_index - 1]
-        if list(first.symbols) != list(second.symbols):
-            raise ValueError(
-                "Selected geometries have different element sequences."
-            )
-        for molecule in (first, second):
-            positions = np.asarray(molecule.positions)
-            if (
-                positions.shape != (len(molecule.symbols), 3)
-                or not np.isfinite(positions).all()
-            ):
-                raise ValueError(
-                    "Selected geometry has invalid or non-finite coordinates."
-                )
-        return first, second
 
     @classmethod
     def from_directorypath(cls, folder, program="xtb", index="-1", **kwargs):
@@ -1452,14 +1408,6 @@ class Molecule:
 
         g16_output = Gaussian16Output(filename=filepath, **kwargs)
         return g16_output.get_molecule(index=index)
-    @staticmethod
-    @file_cache()
-    def _read_gaussian_irc_logfile(filepath, index):
-        """Read recorded IRC geometries without using the general reader."""
-        from chemsmart.io.gaussian.output import Gaussian16Output
-
-        g16_output = Gaussian16Output(filename=filepath)
-        return g16_output.get_irc_molecule(index=index)
 
     @staticmethod
     @file_cache()
